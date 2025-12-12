@@ -10,6 +10,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import io
+import traceback
 
 # -------------------------------------------------
 # BASE DIRECTORY (this makes paths work everywhere)
@@ -44,6 +45,8 @@ class Net(nn.Module):
         self.fc2 = nn.Linear(50, num_classes)
 
     def forward(self, x):
+        # Note: BN layers are defined but not used in your original forward.
+        # Keeping the forward consistent with your lecture-style CNN.
         x = F.relu(F.max_pool2d(self.conv1(x), 2))
         x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
         x = x.view(-1, 20 * 53 * 53)
@@ -62,6 +65,7 @@ def create_resnet18(num_classes: int):
     except Exception:
         model = models.resnet18(pretrained=True)
 
+    # freeze backbone
     for param in model.parameters():
         param.requires_grad = False
 
@@ -132,8 +136,10 @@ class GradCAM:
         def backward_hook(module, grad_in, grad_out):
             self.gradients = grad_out[0].detach()
 
+        # Register hooks
         target_layer.register_forward_hook(forward_hook)
-        target_layer.register_backward_hook(backward_hook)
+        # Use full backward hook (newer PyTorch)
+        target_layer.register_full_backward_hook(backward_hook)
 
     def generate(self, input_tensor, target_class=None):
         self.model.zero_grad()
@@ -159,11 +165,10 @@ class GradCAM:
         return cam  # (1,1,u,v)
 
 
-def generate_gradcam_overlay(pil_image: Image.Image, model_type: str) -> Image.Image:
+def generate_gradcam_overlay(pil_image: Image.Image, model_type: str, target_class: int | None = None) -> Image.Image:
     """
     Returns a PIL image with Grad-CAM heatmap overlay for the selected model.
     """
-    # Resize image (for display and for model)
     img_resized = pil_image.convert("RGB").resize((IMG_SIZE, IMG_SIZE))
     x = preprocess_image(img_resized).to(device)
 
@@ -175,15 +180,12 @@ def generate_gradcam_overlay(pil_image: Image.Image, model_type: str) -> Image.I
         target_layer = model.conv2
 
     gradcam = GradCAM(model, target_layer)
-    cam = gradcam.generate(x).squeeze().cpu()  # (u, v)
+    cam = gradcam.generate(x, target_class=target_class).squeeze().cpu()  # (u, v)
 
-    cam_resized = tv_resize(cam.unsqueeze(0).unsqueeze(0),
-                            [IMG_SIZE, IMG_SIZE]).squeeze().numpy()
+    cam_resized = tv_resize(cam.unsqueeze(0).unsqueeze(0), [IMG_SIZE, IMG_SIZE]).squeeze().numpy()
 
-    # Original image as numpy
     img_np = np.array(img_resized).astype(np.float32) / 255.0
 
-    # Create overlay using matplotlib and return as PIL
     fig, ax = plt.subplots(figsize=(4, 4))
     ax.imshow(img_np)
     ax.imshow(cam_resized, cmap="jet", alpha=0.4)
@@ -202,12 +204,12 @@ def generate_gradcam_overlay(pil_image: Image.Image, model_type: str) -> Image.I
 # -------------------------------------------------
 MODEL_METRICS = {
     "ResNet18 (Transfer Learning)": {
-        "Test Accuracy (%)": 91.16,      
-        "Macro F1-score (%)": 88.09      
+        "Test Accuracy (%)": 91.16,
+        "Macro F1-score (%)": 88.09
     },
     "Custom CNN (Lecture-style)": {
-        "Test Accuracy (%)": 82.81,       
-        "Macro F1-score (%)": 70.05          
+        "Test Accuracy (%)": 82.81,
+        "Macro F1-score (%)": 70.05
     },
 }
 
@@ -232,14 +234,13 @@ def predict(image: Image.Image, model_type: str):
     top_idx = int(np.argmax(probs))
     top_label = CLASS_NAMES[top_idx]
     top_prob = float(probs[top_idx])
-    return top_label, top_prob, probs
+    return top_idx, top_label, top_prob, probs
 
 
 # -------------------------------------------------
-# 9. Streamlit UI
+# 9. Streamlit UI  (FIXED: works with checkbox rerun)
 # -------------------------------------------------
 st.set_page_config(page_title="Corn Disease Detector", layout="centered")
-
 st.title("🌽 Corn Leaf Disease Detection")
 
 # Sidebar: model selector + comparison
@@ -259,10 +260,17 @@ with st.sidebar.expander("📊 Model Comparison (Test Set)", expanded=False):
 st.write(f"Current model: **{model_type}**")
 st.write("Upload an image and the model will classify it as **Blight**, **Common Rust**, **Gray Leaf Spot**, or **Healthy**.")
 
-uploaded_file = st.file_uploader(
-    "Upload a leaf image",
-    type=["jpg", "jpeg", "png"]
-)
+# ---- Session state (keeps results after rerun) ----
+if "pred_done" not in st.session_state:
+    st.session_state.pred_done = False
+    st.session_state.top_idx = None
+    st.session_state.label = None
+    st.session_state.confidence = None
+    st.session_state.probs = None
+    st.session_state.image = None
+    st.session_state.model_type = None
+
+uploaded_file = st.file_uploader("Upload a leaf image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
     image = Image.open(uploaded_file)
@@ -270,22 +278,46 @@ if uploaded_file is not None:
 
     if st.button("🔍 Predict"):
         with st.spinner("Analyzing..."):
-            label, confidence, probs = predict(image, model_type)
+            top_idx, label, confidence, probs = predict(image, model_type)
 
-        st.success(f"**Prediction:** {label}")
-        st.write(f"Confidence: **{confidence:.2%}**")
+        st.session_state.pred_done = True
+        st.session_state.top_idx = top_idx
+        st.session_state.label = label
+        st.session_state.confidence = confidence
+        st.session_state.probs = probs
+        st.session_state.image = image
+        st.session_state.model_type = model_type
 
-        st.subheader("Class Probabilities")
-        prob_table = {
-            "Class": CLASS_NAMES,
-            "Probability": [f"{p:.2%}" for p in probs]
-        }
-        st.table(prob_table)
+# ---- Show results if prediction already happened ----
+if st.session_state.pred_done:
+    st.success(f"**Prediction:** {st.session_state.label}")
+    st.write(f"Confidence: **{st.session_state.confidence:.2%}**")
 
-        # Optional: Grad-CAM visualization
-        if st.checkbox("Show Grad-CAM heatmap for this model"):
+    st.subheader("Class Probabilities")
+    prob_table = {
+        "Class": CLASS_NAMES,
+        "Probability": [f"{p:.2%}" for p in st.session_state.probs]
+    }
+    st.table(prob_table)
+
+    show_cam = st.checkbox("Show Grad-CAM heatmap for this model")
+
+    if show_cam:
+        try:
             with st.spinner("Generating Grad-CAM..."):
-                overlay = generate_gradcam_overlay(image, model_type)
-            st.image(overlay, caption=f"Grad-CAM ({model_type})", use_column_width=True)
+                overlay = generate_gradcam_overlay(
+                    st.session_state.image,
+                    st.session_state.model_type,
+                    target_class=st.session_state.top_idx,  # use predicted class
+                )
+            st.image(
+                overlay,
+                caption=f"Grad-CAM ({st.session_state.model_type})",
+                use_container_width=True
+            )
+        except Exception:
+            st.error("Grad-CAM failed. Here is the error log:")
+            st.code(traceback.format_exc())
+
 else:
     st.info("Please upload a corn leaf image to begin.")
