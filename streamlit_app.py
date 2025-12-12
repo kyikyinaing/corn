@@ -28,13 +28,16 @@ NUM_CLASSES = len(CLASS_NAMES)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # -------------------------------------------------
-# 2. Custom CNN (lecture-style Net)
+# 2. Custom CNN (lecture-style Net)  (UNCHANGED)
 # -------------------------------------------------
 class Net(nn.Module):
     def __init__(self, num_classes=4):
         super(Net, self).__init__()
         self.conv1 = nn.Conv2d(3, 10, kernel_size=5)
+        self.BN1 = nn.BatchNorm2d(10)
+
         self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
+        self.BN2 = nn.BatchNorm2d(20)
         self.conv2_drop = nn.Dropout2d()
 
         # 224x224 -> 110x110 -> 53x53, channels=20
@@ -60,7 +63,6 @@ def create_resnet18(num_classes: int):
     except Exception:
         model = models.resnet18(pretrained=True)
 
-    # Freeze backbone
     for param in model.parameters():
         param.requires_grad = False
 
@@ -115,56 +117,59 @@ def preprocess_image(image: Image.Image):
 
 
 # -------------------------------------------------
-# 6. Grad-CAM (FIXED: reliable gradient capture)
+# 6. Grad-CAM implementation (FIXED for ResNet18)
+#    - No backward_hook
+#    - Use autograd.grad
 # -------------------------------------------------
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
         self.model.eval()
-        self.gradients = None
+        self.target_layer = target_layer
         self.activations = None
 
         def forward_hook(module, inp, out):
-            self.activations = out
-            out.register_hook(self._save_gradients)
+            self.activations = out  # keep tensor for autograd
 
         self.hook_handle = target_layer.register_forward_hook(forward_hook)
-
-    def _save_gradients(self, grad):
-        self.gradients = grad
 
     def remove(self):
         self.hook_handle.remove()
 
     def generate(self, input_tensor, target_class=None):
-        self.gradients = None
         self.activations = None
 
-        input_tensor = input_tensor.requires_grad_(True)
+        with torch.enable_grad():
+            input_tensor = input_tensor.requires_grad_(True)
+            output = self.model(input_tensor)
 
-        out = self.model(input_tensor)  # logits or log_probs
-        if target_class is None:
-            target_class = int(out.argmax(dim=1).item())
+            if target_class is None:
+                target_class = int(output.argmax(dim=1).item())
 
-        score = out[0, target_class]
-        self.model.zero_grad(set_to_none=True)
-        score.backward(retain_graph=True)
+            score = output[0, target_class]
 
-        if self.gradients is None or self.activations is None:
-            raise RuntimeError("Grad-CAM failed: gradients/activations not captured. Try a different target layer.")
+            if self.activations is None:
+                raise RuntimeError("Grad-CAM failed: no activations captured. Check target layer.")
 
-        grads = self.gradients
-        acts = self.activations
+            grads = torch.autograd.grad(
+                outputs=score,
+                inputs=self.activations,
+                retain_graph=True,
+                allow_unused=True
+            )[0]
 
-        weights = grads.mean(dim=(2, 3), keepdim=True)
-        cam = (weights * acts).sum(dim=1, keepdim=True)
-        cam = torch.relu(cam)
+            if grads is None:
+                raise RuntimeError("Grad-CAM failed: gradients are None. Try different target layer.")
 
-        cam -= cam.min()
-        if cam.max() != 0:
-            cam /= cam.max()
+            weights = grads.mean(dim=(2, 3), keepdim=True)
+            cam = (weights * self.activations).sum(dim=1, keepdim=True)
+            cam = torch.relu(cam)
 
-        return cam  # (1,1,h,w)
+            cam -= cam.min()
+            if cam.max() != 0:
+                cam /= cam.max()
+
+            return cam  # (1,1,h,w)
 
 
 def generate_gradcam_overlay(pil_image: Image.Image, model_type: str, target_class: int | None = None) -> Image.Image:
@@ -176,16 +181,14 @@ def generate_gradcam_overlay(pil_image: Image.Image, model_type: str, target_cla
 
     if model_type == "ResNet18 (Transfer Learning)":
         model = load_resnet_model()
-        target_layer = model.layer4[-1]   # ✅ reliable for ResNet18
+        target_layer = model.layer4  # ✅ safest for ResNet18
     else:
         model = load_customcnn_model()
         target_layer = model.conv2
 
     gradcam = GradCAM(model, target_layer)
-    cam_tensor = gradcam.generate(x, target_class=target_class)  # (1,1,h,w)
+    cam = gradcam.generate(x, target_class=target_class).squeeze().detach().cpu()
     gradcam.remove()
-
-    cam = cam_tensor.squeeze().detach().cpu()  # (h,w)
 
     cam_resized = tv_resize(
         cam.unsqueeze(0).unsqueeze(0),
@@ -203,14 +206,13 @@ def generate_gradcam_overlay(pil_image: Image.Image, model_type: str, target_cla
     plt.tight_layout()
     plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
     plt.close(fig)
-
     buf.seek(0)
     overlay = Image.open(buf)
     return overlay
 
 
 # -------------------------------------------------
-# 7. Model comparison (your real metrics)
+# 7. Model comparison (fill with your real test metrics)
 # -------------------------------------------------
 MODEL_METRICS = {
     "ResNet18 (Transfer Learning)": {
@@ -225,7 +227,7 @@ MODEL_METRICS = {
 
 
 # -------------------------------------------------
-# 8. Prediction helper
+# 8. Prediction helper (UNCHANGED)
 # -------------------------------------------------
 def predict(image: Image.Image, model_type: str):
     x = preprocess_image(image).to(device)
@@ -248,7 +250,7 @@ def predict(image: Image.Image, model_type: str):
 
 
 # -------------------------------------------------
-# 9. Streamlit UI (FIXED: checkbox works)
+# 9. Streamlit UI (FIXED checkbox logic)
 # -------------------------------------------------
 st.set_page_config(page_title="Corn Disease Detector", layout="centered")
 st.title("🌽 Corn Leaf Disease Detection")
@@ -269,7 +271,7 @@ with st.sidebar.expander("📊 Model Comparison (Test Set)", expanded=False):
 st.write(f"Current model: **{model_type}**")
 st.write("Upload an image and the model will classify it as **Blight**, **Common Rust**, **Gray Leaf Spot**, or **Healthy**.")
 
-# Session state
+# ---- Session state (so checkbox works after rerun) ----
 if "pred_done" not in st.session_state:
     st.session_state.pred_done = False
     st.session_state.top_idx = None
