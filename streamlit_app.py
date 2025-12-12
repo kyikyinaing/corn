@@ -255,10 +255,13 @@ def predict(image: Image.Image, model_type: str):
 st.set_page_config(page_title="Corn Disease Detector", layout="centered")
 st.title("🌽 Corn Leaf Disease Detection")
 
+st.sidebar.markdown("### **Choose Model**")
+
 model_type = st.sidebar.selectbox(
-    "Choose model",
+    "",
     ("ResNet18 (Transfer Learning)", "Custom CNN (Lecture-style)")
 )
+
 
 with st.sidebar.expander("📊 Model Comparison (Test Set)", expanded=False):
     st.write("These values come from your Colab evaluation.")
